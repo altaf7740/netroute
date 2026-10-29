@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """NetRoute: pick one NIC for internet and other NICs for specific local subnets (macOS)."""
-import json, re, subprocess, tkinter as tk
+import json, os, re, subprocess, tempfile, tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-RULES_FILE = Path.home() / ".netroute_rules.json"
+CONFIG_FILE = Path.home() / ".netroute_config.json"
+LEGACY_FILE = Path.home() / ".netroute_rules.json"
+DAEMON_SRC = Path(__file__).resolve().with_name("netroute_daemon.py")
+DAEMON_DST = "/usr/local/libexec/netroute_daemon.py"
+PLIST = "/Library/LaunchDaemons/com.netroute.daemon.plist"
+STATUS_FILE = Path("/var/tmp/netroute_status.json")
 CIDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
 IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
@@ -46,8 +51,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("NetRoute")
-        self.geometry("820x560")
-        self.rules = json.loads(RULES_FILE.read_text()) if RULES_FILE.exists() else []
+        self.geometry("820x780")
+        self.rules, self.priority = [], []
+        if CONFIG_FILE.exists():
+            cfg = json.loads(CONFIG_FILE.read_text())
+            self.rules, self.priority = cfg.get("rules", []), cfg.get("priority", [])
+        elif LEGACY_FILE.exists():
+            self.rules = json.loads(LEGACY_FILE.read_text())
         self.svcs = []
 
         top = ttk.LabelFrame(self, text="Active network interfaces")
@@ -63,6 +73,16 @@ class App(tk.Tk):
         bar = ttk.Frame(top); bar.pack(fill="x", padx=6, pady=6)
         ttk.Button(bar, text="Refresh", command=self.refresh).pack(side="left")
         ttk.Button(bar, text="Use selected for INTERNET", command=self.set_internet).pack(side="left", padx=8)
+
+        fo = ttk.LabelFrame(self, text="Internet failover order (first available is used)")
+        fo.pack(fill="x", padx=10, pady=4)
+        self.plist = tk.Listbox(fo, height=4)
+        self.plist.pack(side="left", fill="x", expand=True, padx=6, pady=6)
+        pb = ttk.Frame(fo); pb.pack(side="left", padx=6, pady=6)
+        for txt, cmd in (("Add selected", self.pri_add), ("Remove", self.pri_remove),
+                         ("Move up", lambda: self.pri_move(-1)), ("Move down", lambda: self.pri_move(1)),
+                         ("Save & apply", self.pri_apply)):
+            ttk.Button(pb, text=txt, command=cmd).pack(fill="x", pady=1)
 
         mid = ttk.LabelFrame(self, text="Local network rules (subnet → interface)")
         mid.pack(fill="both", expand=True, padx=10, pady=4)
@@ -85,8 +105,98 @@ class App(tk.Tk):
         ttk.Button(bar2, text="Remove selected", command=self.remove_rule).pack(side="left")
         ttk.Button(bar2, text="Re-apply all rules", command=self.apply_all).pack(side="left", padx=8)
 
+        hp = ttk.LabelFrame(self, text="Auto-reapply helper (re-adds routes & failover when a NIC reconnects)")
+        hp.pack(fill="x", padx=10, pady=4)
+        self.helper_lbl = ttk.Label(hp, text="")
+        self.helper_lbl.pack(side="left", padx=6, pady=6)
+        ttk.Button(hp, text="Uninstall", command=self.helper_uninstall).pack(side="right", padx=6)
+        ttk.Button(hp, text="Install / update", command=self.helper_install).pack(side="right")
+
         self.status = ttk.Label(self, text="Ready", anchor="w")
         self.status.pack(fill="x", padx=10, pady=4)
+        self.refresh()
+        self.poll_helper()
+
+    def save(self):
+        CONFIG_FILE.write_text(json.dumps(dict(rules=self.rules, priority=self.priority), indent=2))
+
+    def poll_helper(self):
+        if not os.path.exists(PLIST):
+            txt = "Not installed - routes must be re-applied manually"
+        else:
+            try:
+                st = json.loads(STATUS_FILE.read_text())
+                txt = f"Running - last action {st['time']}: {st['event']}  (down: {', '.join(st['down']) or 'none'})"
+            except Exception:
+                txt = "Installed - waiting for first status"
+        self.helper_lbl.config(text=txt)
+        self.after(3000, self.poll_helper)
+
+    def helper_install(self):
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.netroute.daemon</string>
+<key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>{DAEMON_DST}</string><string>{CONFIG_FILE}</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+</dict></plist>
+"""
+        self.save()
+        with tempfile.NamedTemporaryFile("w", suffix=".plist", delete=False) as f:
+            f.write(plist)
+        try:
+            admin("; ".join([
+                "mkdir -p /usr/local/libexec",
+                f"cp {sh(str(DAEMON_SRC))} {DAEMON_DST}",
+                f"chown root:wheel {DAEMON_DST}", f"chmod 755 {DAEMON_DST}",
+                f"cp {sh(f.name)} {PLIST}", f"chown root:wheel {PLIST}", f"chmod 644 {PLIST}",
+                "launchctl bootout system/com.netroute.daemon 2>/dev/null || true",
+                f"launchctl bootstrap system {PLIST}"]))
+            self.say("Helper installed and running")
+        except RuntimeError as e:
+            self.say(f"Failed: {e}")
+        os.unlink(f.name)
+
+    def helper_uninstall(self):
+        try:
+            admin("; ".join(["launchctl bootout system/com.netroute.daemon 2>/dev/null || true",
+                             f"rm -f {PLIST} {DAEMON_DST}"]))
+            self.say("Helper removed")
+        except RuntimeError as e:
+            self.say(f"Failed: {e}")
+
+    def pri_add(self):
+        sel = self.tree.selection()
+        if sel:
+            n = self.svcs[int(sel[0])]["name"]
+            if n not in self.priority:
+                self.priority.append(n)
+                self.refresh()
+
+    def pri_remove(self):
+        sel = self.plist.curselection()
+        if sel:
+            self.priority.pop(sel[0])
+            self.refresh()
+
+    def pri_move(self, d):
+        sel = self.plist.curselection()
+        if sel and 0 <= sel[0] + d < len(self.priority):
+            i = sel[0]
+            self.priority[i], self.priority[i + d] = self.priority[i + d], self.priority[i]
+            self.refresh()
+            self.plist.selection_set(i + d)
+
+    def pri_apply(self):
+        """Save the order and make it the macOS Service Order (priority first)."""
+        self.save()
+        names = [x["name"] for x in services()]
+        order = [n for n in self.priority if n in names] + [n for n in names if n not in self.priority]
+        try:
+            admin("networksetup -ordernetworkservices " + " ".join(sh(n) for n in order))
+            self.say("Failover order saved and applied")
+        except RuntimeError as e:
+            self.say(f"Failed: {e}")
         self.refresh()
 
     def say(self, msg):
@@ -102,6 +212,10 @@ class App(tk.Tk):
             self.dev_cb.current(0)
         gw, dev = current_default()
         self.default_lbl.config(text=f"Current internet route: via {gw or '?'} on {dev or '?'}")
+        self.plist.delete(0, "end")
+        up = {x["name"] for x in self.svcs}
+        for i, n in enumerate(self.priority, 1):
+            self.plist.insert("end", f"{i}. {n}" + ("" if n in up else "   (disconnected)"))
         self.rlist.delete(0, "end")
         for r in self.rules:
             self.rlist.insert("end", f'{r["cidr"]}  →  {r["dev"]}' + (f'  gw {r["gw"]}' if r["gw"] else ""))
@@ -113,6 +227,8 @@ class App(tk.Tk):
         s = self.svcs[int(sel[0])]
         if not s["gw"]:
             return messagebox.showerror("NetRoute", "That interface has no gateway (no internet).")
+        self.priority = [s["name"]] + [n for n in self.priority if n != s["name"]]
+        self.save()
         order = [x["name"] for x in services()]
         order = [s["name"]] + [n for n in order if n != s["name"]]
         script = ("networksetup -ordernetworkservices " + " ".join(sh(n) for n in order) +
@@ -140,7 +256,7 @@ class App(tk.Tk):
         except RuntimeError as e:
             return self.say(f"Failed: {e}")
         self.rules = [x for x in self.rules if x["cidr"] != cidr] + [r]
-        RULES_FILE.write_text(json.dumps(self.rules, indent=2))
+        self.save()
         self.say(f"{cidr} → {r['dev']} applied")
         self.refresh()
 
@@ -153,7 +269,7 @@ class App(tk.Tk):
             admin(self.rule_cmd(r, "del"))
         except RuntimeError as e:
             self.say(f"Failed: {e}")
-        RULES_FILE.write_text(json.dumps(self.rules, indent=2))
+        self.save()
         self.refresh()
 
     def apply_all(self):
@@ -161,7 +277,7 @@ class App(tk.Tk):
             return
         try:
             admin("; ".join(self.rule_cmd(r, "add") for r in self.rules))
-            self.say("All rules re-applied (routes reset on reboot/network change, so re-apply when needed)")
+            self.say("All rules re-applied (install the helper to do this automatically)")
         except RuntimeError as e:
             self.say(f"Failed: {e}")
 
